@@ -20,7 +20,6 @@ package com.android.camera;
 import android.animation.Animator;
 import android.annotation.TargetApi;
 import android.app.ActionBar;
-import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.ActivityNotFoundException;
@@ -46,10 +45,14 @@ import android.nfc.NfcEvent;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
+import android.os.storage.StorageEventListener;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.TextUtils;
@@ -104,6 +107,7 @@ import com.android.camera.hardware.HardwareSpec;
 import com.android.camera.hardware.HardwareSpecImpl;
 import com.android.camera.module.ModuleController;
 import com.android.camera.module.ModulesInfo;
+import com.android.camera.one.OneCameraException;
 import com.android.camera.one.OneCameraManager;
 import com.android.camera.session.CaptureSession;
 import com.android.camera.session.CaptureSessionManager;
@@ -128,13 +132,15 @@ import com.android.camera.util.GcamHelper;
 import com.android.camera.util.GoogleHelpHelper;
 import com.android.camera.util.IntentHelper;
 import com.android.camera.util.PhotoSphereHelper.PanoramaViewHelper;
-import com.android.camera.util.ReleaseDialogHelper;
+import com.android.camera.util.QuickActivity;
+import com.android.camera.util.ReleaseHelper;
 import com.android.camera.util.UsageStatistics;
 import com.android.camera.widget.FilmstripView;
 import com.android.camera.widget.Preloader;
 import com.android.camera2.R;
 import com.android.ex.camera2.portability.CameraAgent;
 import com.android.ex.camera2.portability.CameraAgentFactory;
+import com.android.ex.camera2.portability.CameraExceptionHandler;
 import com.android.ex.camera2.portability.CameraSettings;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.GlideBuilder;
@@ -154,7 +160,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
-public class CameraActivity extends Activity
+public class CameraActivity extends QuickActivity
         implements AppController, CameraAgent.CameraOpenCallback,
         ShareActionProvider.OnShareTargetSelectedListener,
         OrientationManager.OnOrientationChangeListener, SettingsManager.OnSettingChangedListener {
@@ -165,6 +171,8 @@ public class CameraActivity extends Activity
             "android.media.action.STILL_IMAGE_CAMERA_SECURE";
     public static final String ACTION_IMAGE_CAPTURE_SECURE =
             "android.media.action.IMAGE_CAPTURE_SECURE";
+    public static final String INTENT_GALLERY3D_STORAGE_CHANGE =
+            "com.android.gallery3d.STORAGE_CHANGE";
 
     // The intent extra for camera from secure lock screen. True if the gallery
     // should only show newly captured pictures. sSecureAlbumId does not
@@ -183,6 +191,13 @@ public class CameraActivity extends Activity
 
     /** Should be used wherever a context is needed. */
     private Context mAppContext;
+
+    /**
+     * Camera fatal error handling:
+     * 1) Present error dialog to guide users to exit the app.
+     * 2) If users hit home button, onPause should just call finish() to exit the app.
+     */
+    private boolean mCameraFatalError = false;
 
     /**
      * Whether onResume should reset the view to the preview.
@@ -210,6 +225,8 @@ public class CameraActivity extends Activity
     private Intent mResultDataForTesting;
     private OnScreenHint mStorageHint;
     private final Object mStorageSpaceLock = new Object();
+    private String mStoragePath;
+    private StorageManager mStorageManager;
     private long mStorageSpaceBytes = Storage.LOW_STORAGE_THRESHOLD_BYTES;
     private boolean mAutoRotateScreen;
     private boolean mSecureCamera;
@@ -275,20 +292,14 @@ public class CameraActivity extends Activity
         return mModuleManager;
     }
 
-    // close activity when screen turns off
-    private final BroadcastReceiver mScreenOffReceiver = new BroadcastReceiver() {
+    /**
+     * Close activity when secure app passes lock screen or screen turns
+     * off.
+     */
+    private final BroadcastReceiver mShutdownReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             finish();
-        }
-    };
-
-    private final ActionBar.OnMenuVisibilityListener mOnMenuVisibilityListener =
-            new ActionBar.OnMenuVisibilityListener() {
-        @Override
-        public void onMenuVisibilityChanged(boolean isVisible) {
-            // TODO: Remove this or bring back the original implementation: cancel
-            // auto-hide actionbar.
         }
     };
 
@@ -384,8 +395,8 @@ public class CameraActivity extends Activity
                             fileAgeFromDataID(currentDataId));
                     // If applicable, show release information before this item
                     // is shared.
-                    if (ReleaseDialogHelper.shouldShowReleaseInfoDialogOnShare(data)) {
-                        ReleaseDialogHelper.showReleaseInfoDialog(CameraActivity.this,
+                    if (ReleaseHelper.shouldShowReleaseInfoDialogOnShare(data)) {
+                        ReleaseHelper.showReleaseInfoDialog(CameraActivity.this,
                                 new Callback<Void>() {
                                     @Override
                                     public void onCallback(Void result) {
@@ -537,8 +548,9 @@ public class CameraActivity extends Activity
 
     @Override
     public void onCameraDisabled(int cameraId) {
-        UsageStatistics.instance().cameraFailure(eventprotos.CameraFailure.FailureReason.SECURITY,
-                null);
+        UsageStatistics.instance().cameraFailure(
+                eventprotos.CameraFailure.FailureReason.SECURITY, null,
+                UsageStatistics.NONE, UsageStatistics.NONE);
         Log.w(TAG, "Camera disabled: " + cameraId);
         CameraUtil.showErrorAndFinish(this, R.string.camera_disabled);
     }
@@ -546,7 +558,8 @@ public class CameraActivity extends Activity
     @Override
     public void onDeviceOpenFailure(int cameraId, String info) {
         UsageStatistics.instance().cameraFailure(
-                eventprotos.CameraFailure.FailureReason.OPEN_FAILURE, info);
+                eventprotos.CameraFailure.FailureReason.OPEN_FAILURE, info,
+                UsageStatistics.NONE, UsageStatistics.NONE);
         Log.w(TAG, "Camera open failure: " + info);
         CameraUtil.showErrorAndFinish(this, R.string.cannot_connect_camera);
     }
@@ -560,7 +573,8 @@ public class CameraActivity extends Activity
     @Override
     public void onReconnectionFailure(CameraAgent mgr, String info) {
         UsageStatistics.instance().cameraFailure(
-                eventprotos.CameraFailure.FailureReason.RECONNECT_FAILURE, null);
+                eventprotos.CameraFailure.FailureReason.RECONNECT_FAILURE, null,
+                UsageStatistics.NONE, UsageStatistics.NONE);
         Log.w(TAG, "Camera reconnection failure:" + info);
         CameraUtil.showErrorAndFinish(this, R.string.cannot_connect_camera);
     }
@@ -571,6 +585,10 @@ public class CameraActivity extends Activity
             initPowerShutter();
         } else if (key.equals(Keys.KEY_MAX_BRIGHTNESS)) {
             initMaxBrightness();
+        } else if (key.equals(Keys.KEY_STORAGE)) {
+            if (setStoragePath()) {
+                updateStorageSpaceAndHint(null);
+            }
         }
     }
 
@@ -1325,31 +1343,77 @@ public class CameraActivity extends Activity
         }
     }
 
-    private final CameraAgent.CameraExceptionCallback mCameraDefaultExceptionCallback
-        = new CameraAgent.CameraExceptionCallback() {
+    /**
+     * Note: Make sure this callback is unregistered properly when the activity
+     * is destroyed since we're otherwise leaking the Activity reference.
+     */
+    private final CameraExceptionHandler.CameraExceptionCallback mCameraExceptionCallback
+        = new CameraExceptionHandler.CameraExceptionCallback() {
                 @Override
-                public void onCameraException(RuntimeException e) {
-                    Log.e(TAG, "Camera Exception", e);
-                    CameraUtil.showErrorAndFinish(CameraActivity.this,
-                            R.string.cannot_connect_camera);
+                public void onCameraError(int errorCode) {
+                    // Not a fatal error. only do Log.e().
+                    Log.e(TAG, "Camera error callback. error=" + errorCode);
+                }
+                @Override
+                public void onCameraException(
+                        RuntimeException ex, String commandHistory, int action, int state) {
+                    Log.e(TAG, "Camera Exception", ex);
+                    UsageStatistics.instance().cameraFailure(
+                            eventprotos.CameraFailure.FailureReason.API_RUNTIME_EXCEPTION,
+                            commandHistory, action, state);
+                    onFatalError();
+                }
+                @Override
+                public void onDispatchThreadException(RuntimeException ex) {
+                    Log.e(TAG, "DispatchThread Exception", ex);
+                    UsageStatistics.instance().cameraFailure(
+                            eventprotos.CameraFailure.FailureReason.API_TIMEOUT,
+                            null, UsageStatistics.NONE, UsageStatistics.NONE);
+                    onFatalError();
+                }
+                private void onFatalError() {
+                    if (mCameraFatalError) {
+                        return;
+                    }
+                    mCameraFatalError = true;
+
+                    // If the activity receives exception during onPause, just exit the app.
+                    if (mPaused && !isFinishing()) {
+                        Log.e(TAG, "Fatal error during onPause, call Activity.finish()");
+                        finish();
+                    } else {
+                        CameraUtil.showErrorAndFinish(CameraActivity.this,
+                                R.string.cannot_connect_camera);
+                    }
                 }
             };
 
     @Override
-    public void onCreate(Bundle state) {
+    public void onNewIntentTasks(Intent intent) {
+        onModeSelected(getModeIndex());
+    }
+
+    @Override
+    public void onCreateTasks(Bundle state) {
         CameraPerformanceTracker.onEvent(CameraPerformanceTracker.ACTIVITY_START);
-        super.onCreate(state);
+        mAppContext = getApplication().getBaseContext();
+
         if (!Glide.isSetup()) {
-            Glide.setup(new GlideBuilder(this)
-                .setResizeService(new FifoPriorityThreadPoolExecutor(1)));
-            Glide.get(this).setMemoryCategory(MemoryCategory.HIGH);
+            Glide.setup(new GlideBuilder(getAndroidContext())
+                .setResizeService(new FifoPriorityThreadPoolExecutor(2)));
+            Glide.get(getAndroidContext()).setMemoryCategory(MemoryCategory.HIGH);
         }
 
         mOnCreateTime = System.currentTimeMillis();
-        mAppContext = getApplicationContext();
         mSoundPlayer = new SoundPlayer(mAppContext);
 
-        mCameraManager = OneCameraManager.get(this);
+        try {
+            mCameraManager = OneCameraManager.get(this);
+        } catch (OneCameraException e) {
+            Log.d(TAG, "Creating camera manager failed.", e);
+            CameraUtil.showErrorAndFinish(this, R.string.cannot_connect_camera);
+            return;
+        }
 
         // TODO: Try to move all the resources allocation to happen as soon as
         // possible so we can call module.init() at the earliest time.
@@ -1376,14 +1440,15 @@ public class CameraActivity extends Activity
         } else {
             mActionBar.setBackgroundDrawable(new ColorDrawable(0x80000000));
         }
-        mActionBar.addOnMenuVisibilityListener(mOnMenuVisibilityListener);
 
         mMainHandler = new MainHandler(this, getMainLooper());
         mCameraController = new CameraController(mAppContext, this, mMainHandler,
-                CameraAgentFactory.getAndroidCameraAgent(this, CameraAgentFactory.CameraApi.API_1),
-                CameraAgentFactory.getAndroidCameraAgent(this, CameraAgentFactory.CameraApi.AUTO));
-        mCameraController.setCameraDefaultExceptionCallback(mCameraDefaultExceptionCallback,
-                mMainHandler);
+                CameraAgentFactory.getAndroidCameraAgent(mAppContext,
+                        CameraAgentFactory.CameraApi.API_1),
+                CameraAgentFactory.getAndroidCameraAgent(mAppContext,
+                        CameraAgentFactory.CameraApi.AUTO));
+        mCameraController.setCameraExceptionHandler(
+                new CameraExceptionHandler(mCameraExceptionCallback, mMainHandler));
 
         mModeListView = (ModeListView) findViewById(R.id.mode_list_layout);
         mModeListView.init(mModuleManager.getSupportedModeIndexList());
@@ -1418,10 +1483,17 @@ public class CameraActivity extends Activity
             win.setAttributes(params);
 
             // Filter for screen off so that we can finish secure camera
-            // activity
-            // when screen is off.
-            IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
-            registerReceiver(mScreenOffReceiver, filter);
+            // activity when screen is off.
+            IntentFilter filter_screen_off = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+            registerReceiver(mShutdownReceiver, filter_screen_off);
+
+            // Filter for phone unlock so that we can finish secure camera
+            // via this UI path:
+            //    1. from secure lock screen, user starts secure camera
+            //    2. user presses home button
+            //    3. user unlocks phone
+            IntentFilter filter_user_unlock = new IntentFilter(Intent.ACTION_USER_PRESENT);
+            registerReceiver(mShutdownReceiver, filter_user_unlock);
         }
         mCameraAppUI = new CameraAppUI(this,
                 (MainActivityLayout) findViewById(R.id.activity_root_view), isCaptureIntent());
@@ -1463,14 +1535,6 @@ public class CameraActivity extends Activity
 
         if (!mSecureCamera) {
             mFilmstripController.setDataAdapter(mDataAdapter);
-            if (!isCaptureIntent()) {
-                mDataAdapter.requestLoad(new Callback<Void>() {
-                    @Override
-                    public void onCallback(Void result) {
-                        fillTemporarySessions();
-                    }
-                });
-            }
         } else {
             // Put a lock placeholder as the last image by setting its date to
             // 0.
@@ -1523,6 +1587,8 @@ public class CameraActivity extends Activity
             }
         });
         mMotionManager = getServices().getMotionManager();
+
+        syncStorageSettings();
     }
 
     /**
@@ -1634,7 +1700,7 @@ public class CameraActivity extends Activity
     }
 
     @Override
-    public void onPause() {
+    public void onPauseTasks() {
         CameraPerformanceTracker.onEvent(CameraPerformanceTracker.ACTIVITY_PAUSE);
 
         /*
@@ -1672,26 +1738,25 @@ public class CameraActivity extends Activity
 
         UsageStatistics.instance().backgrounded();
 
-        // Close the camera and wait for the operation done. But if we time out
-        // via RuntimeException, just continue pausing, and request a finish().
-        try {
+        // Camera is in fatal state. A fatal dialog is presented to users, but users just hit home
+        // button. Let's just kill the process.
+        if (mCameraFatalError && !isFinishing()) {
+            Log.v(TAG, "onPause when camera is in fatal state, call Activity.finish()");
+            finish();
+        } else {
+            // Close the camera and wait for the operation done.
             mCameraController.closeCamera(true);
-        } catch (RuntimeException e) {
-            Log.e(TAG, "Exception while closing camera", e);
-            if (!isFinishing()) {
-                finish();
-            }
         }
-
-        super.onPause();
     }
 
     @Override
-    public void onResume() {
+    public void onResumeTasks() {
         CameraPerformanceTracker.onEvent(CameraPerformanceTracker.ACTIVITY_RESUME);
         Log.v(TAG, "Build info: " + Build.DISPLAY);
 
         mPaused = false;
+
+        setStoragePath();
         updateStorageSpaceAndHint(null);
 
         mLastLayoutOrientation = getResources().getConfiguration().orientation;
@@ -1754,10 +1819,10 @@ public class CameraActivity extends Activity
         }
 
         mOrientationManager.resume();
-        super.onResume();
         mPeekAnimationThread = new HandlerThread("Peek animation");
         mPeekAnimationThread.start();
-        mPeekAnimationHandler = new PeekAnimationHandler(mPeekAnimationThread.getLooper());
+        mPeekAnimationHandler = new PeekAnimationHandler(mPeekAnimationThread.getLooper(),
+                mMainHandler, mAboveFilmstripControlLayout);
 
         mCurrentModule.hardResetSettings(mSettingsManager);
         mCurrentModule.resume();
@@ -1822,7 +1887,7 @@ public class CameraActivity extends Activity
                 });
 
         mPanoramaViewHelper.onResume();
-        ReleaseDialogHelper.showReleaseInfoDialogOnStart(this, mSettingsManager);
+        ReleaseHelper.showReleaseInfoDialogOnStart(this, mSettingsManager);
         syncLocationManagerSetting();
 
         final int previewVisibility = getPreviewVisibility();
@@ -1841,8 +1906,7 @@ public class CameraActivity extends Activity
     }
 
     @Override
-    public void onStart() {
-        super.onStart();
+    public void onStartTasks() {
         mIsActivityRunning = true;
         mPanoramaViewHelper.onStart();
 
@@ -1868,22 +1932,24 @@ public class CameraActivity extends Activity
     }
 
     @Override
-    protected void onStop() {
+    protected void onStopTasks() {
         mIsActivityRunning = false;
         mPanoramaViewHelper.onStop();
 
         mLocationManager.disconnect();
-        super.onStop();
     }
 
     @Override
-    public void onDestroy() {
+    public void onDestroyTasks() {
         if (mSecureCamera) {
-            unregisterReceiver(mScreenOffReceiver);
+            unregisterReceiver(mShutdownReceiver);
         }
-        mActionBar.removeOnMenuVisibilityListener(mOnMenuVisibilityListener);
+        if (mStorageManager != null) {
+            mStorageManager.unregisterListener(mStorageEventListener);
+        }
         mSettingsManager.removeAllListeners();
         mCameraController.removeCallbackReceiver();
+        mCameraController.setCameraExceptionHandler(null);
         getContentResolver().unregisterContentObserver(mLocalImagesObserver);
         getContentResolver().unregisterContentObserver(mLocalVideosObserver);
         getServices().getCaptureSessionManager().removeSessionListener(mSessionListener);
@@ -1894,13 +1960,8 @@ public class CameraActivity extends Activity
         mOrientationManager = null;
         mButtonManager = null;
         mSoundPlayer.release();
-        try {
-            CameraAgentFactory.recycle(CameraAgentFactory.CameraApi.API_1);
-            CameraAgentFactory.recycle(CameraAgentFactory.CameraApi.AUTO);
-        } catch (RuntimeException e) {
-            Log.e(TAG, "CameraAgentFactory exception during destroy", e);
-        }
-        super.onDestroy();
+        CameraAgentFactory.recycle(CameraAgentFactory.CameraApi.API_1);
+        CameraAgentFactory.recycle(CameraAgentFactory.CameraApi.AUTO);
     }
 
     @Override
@@ -2041,6 +2102,17 @@ public class CameraActivity extends Activity
         return super.onCreateOptionsMenu(menu);
     }
 
+    @Override
+    public boolean onPrepareOptionsMenu(Menu menu) {
+        if (isSecureCamera() && !ApiHelper.isLOrHigher()) {
+            // Compatibility pre-L: launching new activities right above
+            // lockscreen does not reliably work, only show help if not secure
+            menu.removeItem(R.id.action_help_and_feedback);
+        }
+
+        return super.onPrepareOptionsMenu(menu);
+    }
+
     protected long getStorageSpaceBytes() {
         synchronized (mStorageSpaceLock) {
             return mStorageSpaceBytes;
@@ -2114,9 +2186,15 @@ public class CameraActivity extends Activity
             }
             mStorageHint.show();
             UsageStatistics.instance().storageWarning(storageSpace);
+
+            // Disable all user interactions,
+            mCameraAppUI.setDisableAllUserInteractions(true);
         } else if (mStorageHint != null) {
             mStorageHint.cancel();
             mStorageHint = null;
+
+            // Re-enable all user interactions.
+            mCameraAppUI.setDisableAllUserInteractions(false);
         }
     }
 
@@ -2182,7 +2260,6 @@ public class CameraActivity extends Activity
 
         mCameraAppUI.resetBottomControls(mCurrentModule, modeIndex);
         mCameraAppUI.addShutterListener(mCurrentModule);
-        mCameraAppUI.hideLetterboxing();
         openModule(mCurrentModule);
         mCurrentModule.onOrientationChanged(mLastRawOrientation);
         // Store the module index so we can use it the next time the Camera
@@ -2367,10 +2444,12 @@ public class CameraActivity extends Activity
     private void openModule(CameraModule module) {
         module.init(this, isSecureCamera(), isCaptureIntent());
         module.hardResetSettings(mSettingsManager);
-        module.resume();
-        UsageStatistics.instance().changeScreen(currentUserInterfaceMode(),
-                NavigationChange.InteractionCause.BUTTON);
-        updatePreviewVisibility();
+        if (!mPaused) {
+            module.resume();
+            UsageStatistics.instance().changeScreen(currentUserInterfaceMode(),
+                    NavigationChange.InteractionCause.BUTTON);
+            updatePreviewVisibility();
+        }
     }
 
     private void closeModule(CameraModule module) {
@@ -2461,6 +2540,11 @@ public class CameraActivity extends Activity
 
     @Override
     public void onOrientationChanged(int orientation) {
+        if (orientation != mLastRawOrientation) {
+            Log.v(TAG, "orientation changed (from:to) " + mLastRawOrientation +
+                    ":" + orientation);
+        }
+
         // We keep the last known orientation. So if the user first orient
         // the camera then point the camera to floor or sky, we still have
         // the correct orientation.
@@ -2702,7 +2786,7 @@ public class CameraActivity extends Activity
         filmstripBottomPanel.setViewerButtonVisibility(viewButtonVisibility);
     }
 
-    private class PeekAnimationHandler extends Handler {
+    private static class PeekAnimationHandler extends Handler {
         private class DataAndCallback {
             LocalData mData;
             com.android.camera.util.Callback<Bitmap> mCallback;
@@ -2714,8 +2798,14 @@ public class CameraActivity extends Activity
             }
         }
 
-        public PeekAnimationHandler(Looper looper) {
+        private final Handler mMainHandler;
+        private final FrameLayout mAboveFilmstripControlLayout;
+
+        public PeekAnimationHandler(Looper looper, Handler mainHandler,
+                FrameLayout aboveFilmstripControlLayout) {
             super(looper);
+            mMainHandler = mainHandler;
+            mAboveFilmstripControlLayout = aboveFilmstripControlLayout;
         }
 
         /**
@@ -2829,4 +2919,80 @@ public class CameraActivity extends Activity
         boolean showDetails = (type == LocalData.LOCAL_IMAGE) || (type == LocalData.LOCAL_VIDEO);
         detailsMenuItem.setVisible(showDetails);
     }
+
+    protected boolean setStoragePath() {
+        String storagePath = mSettingsManager.getString(SettingsManager.SCOPE_GLOBAL,
+                Keys.KEY_STORAGE);
+        Storage.setRoot(storagePath);
+        if (storagePath.equals(mStoragePath)) {
+            return false;
+        }
+        mStoragePath = storagePath;
+
+        // Sync the swipe preview with the right path
+        if (mDataAdapter != null) {
+            mDataAdapter.flush();
+            if (!mSecureCamera) {
+                mDataAdapter.requestLoad(new Callback<Void>() {
+                    @Override
+                    public void onCallback(Void result) {
+                        fillTemporarySessions();
+                    }
+                });
+            }
+        }
+
+        // Update the gallery app
+        Intent intent = new Intent(INTENT_GALLERY3D_STORAGE_CHANGE);
+        intent.putExtra(Keys.KEY_STORAGE, mStoragePath);
+        sendBroadcast(intent);
+        return true;
+    }
+
+    protected void syncStorageSettings() {
+        if (mStorageManager == null) {
+            mStorageManager = (StorageManager) getSystemService(Context.STORAGE_SERVICE);
+            mStorageManager.registerListener(mStorageEventListener);
+        }
+        StorageVolume[] volumes = mStorageManager.getVolumeList();
+        List<String> values = new ArrayList<String>(volumes.length);
+        List<StorageVolume> mountedVolumes = new ArrayList<StorageVolume>(volumes.length);
+
+        // Find all mounted volumes
+        String defaultValue = Environment.getExternalStorageDirectory().toString();
+        for (int i = 0; i < volumes.length; i++) {
+            StorageVolume v = volumes[i];
+            if (mStorageManager.getVolumeState(v.getPath()).equals(Environment.MEDIA_MOUNTED)) {
+                values.add(v.getPath());
+                mountedVolumes.add(v);
+                if (v.isPrimary()) {
+                    defaultValue = v.getPath();
+                }
+            }
+        }
+        SettingsUtil.setMountedStorageVolumes(mountedVolumes);
+
+        mSettingsManager.setDefaults(Keys.KEY_STORAGE, defaultValue,
+                values.toArray(new String[values.size()]));
+
+        // Check if current volume is mounted. If not, restore the default storage path.
+        try {
+            mSettingsManager.getIndexOfCurrentValue(SettingsManager.SCOPE_GLOBAL,
+                    Keys.KEY_STORAGE);
+        } catch (IllegalStateException e) {
+            mSettingsManager.setToDefault(SettingsManager.SCOPE_GLOBAL, Keys.KEY_STORAGE);
+        }
+
+        if (setStoragePath()) {
+            updateStorageSpaceAndHint(null);
+        }
+    }
+
+    private StorageEventListener mStorageEventListener = new StorageEventListener () {
+        @Override
+        public void onStorageStateChanged(String path, String oldState, String newState) {
+            Log.v(TAG, "onStorageStateChanged: " + path + "(" + oldState + "->" + newState + ")");
+            syncStorageSettings();
+        }
+    };
 }

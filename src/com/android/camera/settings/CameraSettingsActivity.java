@@ -23,6 +23,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.SharedPreferences.OnSharedPreferenceChangeListener;
 import android.os.Bundle;
+import android.os.storage.StorageVolume;
 import android.preference.ListPreference;
 import android.preference.Preference;
 import android.preference.Preference.OnPreferenceClickListener;
@@ -49,6 +50,13 @@ import java.util.List;
  * Provides the settings UI for the Camera app.
  */
 public class CameraSettingsActivity extends FragmentActivity {
+    /**
+     * Used to denote a subsection of the preference tree to display in the
+     * Fragment. For instance, if 'Advanced' key is provided, the advanced
+     * preference section will be treated as the root for display. This is used
+     * to enable activity transitions between preference sections, and allows
+     * back/up stack to operate correctly.
+     */
     public static final String PREF_SCREEN_EXTRA = "pref_screen_extra";
 
     @Override
@@ -60,7 +68,10 @@ public class CameraSettingsActivity extends FragmentActivity {
         actionBar.setTitle(R.string.mode_settings);
 
         String prefKey = getIntent().getStringExtra(PREF_SCREEN_EXTRA);
-        CameraSettingsFragment dialog = new CameraSettingsFragment(prefKey);
+        CameraSettingsFragment dialog = new CameraSettingsFragment();
+        Bundle bundle = new Bundle(1);
+        bundle.putString(PREF_SCREEN_EXTRA, prefKey);
+        dialog.setArguments(bundle);
         getFragmentManager().beginTransaction().replace(android.R.id.content, dialog).commit();
     }
 
@@ -83,7 +94,7 @@ public class CameraSettingsActivity extends FragmentActivity {
         private static DecimalFormat sMegaPixelFormat = new DecimalFormat("##0.0");
         private String[] mCamcorderProfileNames;
         private CameraDeviceInfo mInfos;
-        private final String mPrefKey;
+        private String mPrefKey;
         private boolean mGetSubPrefAsRoot = true;
         private boolean mPreferencesRemoved = false;
 
@@ -95,13 +106,15 @@ public class CameraSettingsActivity extends FragmentActivity {
         private SelectedVideoQualities mVideoQualitiesBack;
         private SelectedVideoQualities mVideoQualitiesFront;
 
-        public CameraSettingsFragment(String prefKey) {
-            mPrefKey = prefKey;
-        }
+        private List<StorageVolume> mStorageVolumes;
 
         @Override
         public void onCreate(Bundle savedInstanceState) {
             super.onCreate(savedInstanceState);
+            Bundle arguments = getArguments();
+            if (arguments != null) {
+                mPrefKey = arguments.getString(PREF_SCREEN_EXTRA);
+            }
             Context context = this.getActivity().getApplicationContext();
             addPreferencesFromResource(R.xml.camera_preferences);
 
@@ -125,6 +138,9 @@ public class CameraSettingsActivity extends FragmentActivity {
             // Load the camera sizes.
             loadSizes();
 
+            // Load storage volumes
+            loadStorageVolumeList();
+
             // Make sure to hide settings for cameras that don't exist on this
             // device.
             setVisibilities();
@@ -138,6 +154,15 @@ public class CameraSettingsActivity extends FragmentActivity {
             final PreferenceScreen advancedScreen =
                 (PreferenceScreen) findPreference(PREF_CATEGORY_ADVANCED);
             setPreferenceScreenIntent(advancedScreen);
+
+            // Fill Storage preference
+            final Preference storagePreference = findPreference(Keys.KEY_STORAGE);
+            if (mStorageVolumes == null) {
+                getPreferenceScreen().removePreference(storagePreference);
+            } else {
+                setEntries(storagePreference);
+                setSummary(storagePreference);
+            }
 
             getPreferenceScreen().getSharedPreferences()
                     .registerOnSharedPreferenceChangeListener(this);
@@ -235,6 +260,14 @@ public class CameraSettingsActivity extends FragmentActivity {
          * was found and removed.
          */
         private boolean recursiveDelete(PreferenceGroup group, Preference preference) {
+            if (group == null) {
+                Log.d(TAG, "attempting to delete from null preference group");
+                return false;
+            }
+            if (preference == null) {
+                Log.d(TAG, "attempting to delete null preference");
+                return false;
+            }
             if (group.removePreference(preference)) {
                 // Removal was successful.
                 return true;
@@ -281,6 +314,8 @@ public class CameraSettingsActivity extends FragmentActivity {
                 setEntriesForSelection(mVideoQualitiesBack, listPreference);
             } else if (listPreference.getKey().equals(Keys.KEY_VIDEO_QUALITY_FRONT)) {
                 setEntriesForSelection(mVideoQualitiesFront, listPreference);
+            } else if (listPreference.getKey().equals(Keys.KEY_STORAGE)) {
+                setStorageEntriesForSelection(mStorageVolumes, listPreference);
             }
         }
 
@@ -355,6 +390,28 @@ public class CameraSettingsActivity extends FragmentActivity {
                 entries.add(mCamcorderProfileNames[selectedQualities.small]);
             }
             preference.setEntries(entries.toArray(new String[0]));
+        }
+
+        /**
+         * Sets the entries for the storage list preference.
+         *
+         * @param storageVolumes The storage volumes.
+         * @param preference The preference to set the entries for.
+         */
+        private void setStorageEntriesForSelection(List<StorageVolume> storageVolumes,
+                ListPreference preference) {
+            if (storageVolumes == null) {
+                return;
+            }
+            String[] entries = new String[storageVolumes.size()];
+            String[] entryValues = new String[storageVolumes.size()];
+            for (int i = 0; i < storageVolumes.size(); i++) {
+                StorageVolume v = storageVolumes.get(i);
+                entries[i] = v.getDescription(getActivity());
+                entryValues[i] = v.getPath();
+            }
+            preference.setEntries(entries);
+            preference.setEntryValues(entryValues);
         }
 
         /**
@@ -435,6 +492,14 @@ public class CameraSettingsActivity extends FragmentActivity {
             } else {
                 mPictureSizesFront = null;
                 mVideoQualitiesFront = null;
+            }
+        }
+
+        private void loadStorageVolumeList() {
+            mStorageVolumes = SettingsUtil.getMountedStorageVolumes();
+            if (mStorageVolumes.size() < 2) {
+                // Remove storage preference
+                mStorageVolumes = null;
             }
         }
 
